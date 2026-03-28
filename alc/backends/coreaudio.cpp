@@ -170,6 +170,15 @@ OSStatus GetDevPropertySize(AudioDeviceID devId, AudioDevicePropertyID inPropert
     return AudioObjectGetPropertyDataSize(devId, &addr, 0, nullptr, outSize);
 }
 
+OSStatus SetDevProperty(AudioDeviceID devId, AudioDevicePropertyID propId, bool isCapture,
+    UInt32 elem, UInt32 dataSize, const void *propData)
+{
+    static const AudioObjectPropertyScope scopes[2]{kAudioDevicePropertyScopeOutput,
+        kAudioDevicePropertyScopeInput};
+    const AudioObjectPropertyAddress addr{propId, scopes[isCapture], elem};
+    return AudioObjectSetPropertyData(devId, &addr, 0, nullptr, dataSize, propData);
+}
+
 
 std::string GetDeviceName(AudioDeviceID devId)
 {
@@ -370,6 +379,10 @@ struct CoreAudioPlayback final : public BackendBase {
     { }
     ~CoreAudioPlayback() override;
 
+    static OSStatus RenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags,
+        const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames,
+        AudioBufferList *ioData);
+
     OSStatus MixerProc(AudioUnitRenderActionFlags *ioActionFlags,
         const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames,
         AudioBufferList *ioData) noexcept;
@@ -389,6 +402,15 @@ CoreAudioPlayback::~CoreAudioPlayback()
 {
     AudioUnitUninitialize(mAudioUnit);
     AudioComponentInstanceDispose(mAudioUnit);
+}
+
+
+OSStatus CoreAudioPlayback::RenderCallback(void *inRefCon,
+    AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp,
+    UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData)
+{
+    return static_cast<CoreAudioPlayback*>(inRefCon)->MixerProc(ioActionFlags, inTimeStamp,
+        inBusNumber, inNumberFrames, ioData);
 }
 
 
@@ -643,8 +665,7 @@ bool CoreAudioPlayback::reset()
     /* setup callback */
     mFrameSize = mDevice->frameSizeFromFmt();
     AURenderCallbackStruct input{};
-    input.inputProc = [](void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) noexcept
-    { return static_cast<CoreAudioPlayback*>(inRefCon)->MixerProc(ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData); };
+    input.inputProc = &CoreAudioPlayback::RenderCallback;
     input.inputProcRefCon = this;
 
     err = AudioUnitSetProperty(mAudioUnit, kAudioUnitProperty_SetRenderCallback,
@@ -687,6 +708,10 @@ struct CoreAudioCapture final : public BackendBase {
     explicit CoreAudioCapture(gsl::not_null<DeviceBase*> device) noexcept : BackendBase{device} { }
     ~CoreAudioCapture() override;
 
+    static OSStatus CaptureCallback(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags,
+        const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames,
+        AudioBufferList *ioData);
+
     OSStatus RecordProc(AudioUnitRenderActionFlags *ioActionFlags,
         const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber,
         UInt32 inNumberFrames, AudioBufferList *ioData) noexcept;
@@ -714,6 +739,15 @@ CoreAudioCapture::~CoreAudioCapture()
     if(mAudioUnit)
         AudioComponentInstanceDispose(mAudioUnit);
     mAudioUnit = 0;
+}
+
+
+OSStatus CoreAudioCapture::CaptureCallback(void *inRefCon,
+    AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp,
+    UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData)
+{
+    return static_cast<CoreAudioCapture*>(inRefCon)->RecordProc(ioActionFlags, inTimeStamp,
+        inBusNumber, inNumberFrames, ioData);
 }
 
 
@@ -816,12 +850,72 @@ void CoreAudioCapture::open(std::string_view name)
     if(audioDevice != kAudioDeviceUnknown)
         AudioUnitSetProperty(mAudioUnit, kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global, InputElement, &audioDevice, sizeof(AudioDeviceID));
+
+    if(audioDevice != kAudioDeviceUnknown)
+    {
+        UInt32 propSize{sizeof(AudioValueRange)};
+        AudioValueRange frameSizeRange{};
+        err = GetDevProperty(audioDevice, kAudioDevicePropertyBufferFrameSizeRange, true, 0,
+            propSize, &frameSizeRange);
+        if(err == noErr)
+        {
+            TRACE("CoreAudio capture buffer frame size range for device {}: min={} max={}",
+                audioDevice, frameSizeRange.mMinimum, frameSizeRange.mMaximum);
+        }
+        else
+        {
+            WARN("Failed to query capture buffer frame size range for device {}: '{}' ({})",
+                audioDevice, FourCCPrinter{err}.c_str(), err);
+        }
+
+        UInt32 currentFrameSize{};
+        propSize = sizeof(currentFrameSize);
+        err = GetDevProperty(audioDevice, kAudioDevicePropertyBufferFrameSize, true, 0, propSize,
+            &currentFrameSize);
+        if(err == noErr)
+            TRACE("CoreAudio capture buffer frame size before request for device {}: {}",
+                audioDevice, currentFrameSize);
+        else
+            WARN("Failed to query capture buffer frame size for device {}: '{}' ({})",
+                audioDevice, FourCCPrinter{err}.c_str(), err);
+
+        auto requestedFrameSize = static_cast<UInt32>(mDevice->mUpdateSize);
+        if(frameSizeRange.mMinimum > 0.0 || frameSizeRange.mMaximum > 0.0)
+        {
+            requestedFrameSize = static_cast<UInt32>(std::clamp<double>(requestedFrameSize,
+                frameSizeRange.mMinimum, frameSizeRange.mMaximum));
+        }
+
+        err = SetDevProperty(audioDevice, kAudioDevicePropertyBufferFrameSize, true, 0,
+            sizeof(requestedFrameSize), &requestedFrameSize);
+        if(err == noErr)
+        {
+            UInt32 acceptedFrameSize{};
+            propSize = sizeof(acceptedFrameSize);
+            auto geterr = GetDevProperty(audioDevice, kAudioDevicePropertyBufferFrameSize, true, 0,
+                propSize, &acceptedFrameSize);
+            if(geterr == noErr)
+            {
+                TRACE("CoreAudio capture buffer frame size request for device {}: requested={} accepted={}",
+                    audioDevice, requestedFrameSize, acceptedFrameSize);
+            }
+            else
+            {
+                TRACE("CoreAudio capture buffer frame size request for device {}: requested={} (accepted size unavailable: '{}' ({}))",
+                    audioDevice, requestedFrameSize, FourCCPrinter{geterr}.c_str(), geterr);
+            }
+        }
+        else
+        {
+            WARN("Failed to set capture buffer frame size for device {} to {}: '{}' ({})",
+                audioDevice, requestedFrameSize, FourCCPrinter{err}.c_str(), err);
+        }
+    }
 #endif
 
     // set capture callback
     AURenderCallbackStruct input{};
-    input.inputProc = [](void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) noexcept
-    { return static_cast<CoreAudioCapture*>(inRefCon)->RecordProc(ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData); };
+    input.inputProc = &CoreAudioCapture::CaptureCallback;
     input.inputProcRefCon = this;
 
     err = AudioUnitSetProperty(mAudioUnit, kAudioOutputUnitProperty_SetInputCallback,
