@@ -2411,6 +2411,7 @@ struct WasapiCapture final : BackendBase {
     SampleConverterPtr mSampleConv;
     RingBufferPtr<std::byte> mRing;
 
+    bool mExclusiveMode{false};
     std::atomic<bool> mKillNow{true};
 };
 
@@ -2701,6 +2702,7 @@ auto WasapiCapture::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
 {
     capture = nullptr;
     client = nullptr;
+    mExclusiveMode = false;
 
     auto hr = helper.activateAudioClient(mmdev, __uuidof(IAudioClient), al::out_ptr(client));
     if(FAILED(hr))
@@ -2721,6 +2723,7 @@ auto WasapiCapture::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
     auto InputType = WAVEFORMATEXTENSIBLE{};
     if(!MakeExtensible(&InputType, wfx.get()))
         return E_FAIL;
+    const auto DeviceType = InputType;
     wfx = nullptr;
 
     const auto isRear51 = InputType.Format.nChannels == 6
@@ -2801,18 +2804,97 @@ auto WasapiCapture::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
         InputType.Format.nBlockAlign;
     InputType.Format.cbSize = sizeof(InputType) - sizeof(InputType.Format);
 
-    TraceFormat("Requesting capture format", &InputType.Format);
-    hr = client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &InputType.Format, al::out_ptr(wfx));
-    if(FAILED(hr))
+    const auto sharemode =
+        GetConfigValueBool(mDevice->mDeviceName, "wasapi", "exclusive-mode", false)
+        ? AUDCLNT_SHAREMODE_EXCLUSIVE : AUDCLNT_SHAREMODE_SHARED;
+    mExclusiveMode = (sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE);
+
+    auto const update_candidate = [](WAVEFORMATEXTENSIBLE &fmt, WORD const chans,
+        DWORD const chanmask, WORD const bits, GUID const &subfmt, DWORD const samplerate) noexcept
     {
-        WARN("Failed to check capture format support: {:#x}", as_unsigned(hr));
-        hr = client->GetMixFormat(al::out_ptr(wfx));
+        fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+        fmt.Format.nChannels = chans;
+        fmt.dwChannelMask = chanmask;
+        fmt.Format.wBitsPerSample = bits;
+        fmt.SubFormat = subfmt;
+        /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access) */
+        fmt.Samples.wValidBitsPerSample = bits;
+        fmt.Format.nSamplesPerSec = samplerate;
+        fmt.Format.nBlockAlign = gsl::narrow_cast<WORD>(chans * bits / 8);
+        fmt.Format.nAvgBytesPerSec = samplerate * fmt.Format.nBlockAlign;
+        fmt.Format.cbSize = sizeof(fmt) - sizeof(fmt.Format);
+    };
+    auto try_capture_candidate = [clientptr=client.get(), sharemode, this, &wfx]
+        (char const *const candidate_name, WAVEFORMATEXTENSIBLE const &candidate) -> HRESULT
+    {
+        wfx = nullptr;
+        TRACE("Trying capture format candidate {} in {} mode", candidate_name,
+            mExclusiveMode ? "exclusive" : "shared");
+        TraceFormat("Capture candidate", &candidate.Format);
+        return clientptr->IsFormatSupported(sharemode, &candidate.Format, al::out_ptr(wfx));
+    };
+
+    auto selected = InputType;
+    hr = E_FAIL;
+    if(sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE)
+    {
+        hr = try_capture_candidate("requested", selected);
+
+        if(FAILED(hr) && hr == AUDCLNT_E_UNSUPPORTED_FORMAT)
+        {
+            auto candidate = selected;
+            update_candidate(candidate, candidate.Format.nChannels, candidate.dwChannelMask, 16,
+                KSDATAFORMAT_SUBTYPE_PCM, candidate.Format.nSamplesPerSec);
+            hr = try_capture_candidate("pcm16-same-channels-rate", candidate);
+            if(SUCCEEDED(hr))
+                selected = candidate;
+        }
+        if(FAILED(hr) && hr == AUDCLNT_E_UNSUPPORTED_FORMAT && selected.Format.nChannels != 1)
+        {
+            auto candidate = selected;
+            update_candidate(candidate, 1, MONO, 16, KSDATAFORMAT_SUBTYPE_PCM,
+                candidate.Format.nSamplesPerSec);
+            hr = try_capture_candidate("pcm16-mono-same-rate", candidate);
+            if(SUCCEEDED(hr))
+                selected = candidate;
+        }
+        if(FAILED(hr) && hr == AUDCLNT_E_UNSUPPORTED_FORMAT)
+        {
+            auto candidate = DeviceType;
+            hr = try_capture_candidate("device-native", candidate);
+            if(SUCCEEDED(hr))
+                selected = candidate;
+        }
+        if(FAILED(hr) && hr == AUDCLNT_E_UNSUPPORTED_FORMAT
+            && DeviceType.Format.nChannels != 1)
+        {
+            auto candidate = DeviceType;
+            update_candidate(candidate, 1, MONO, 16, KSDATAFORMAT_SUBTYPE_PCM,
+                candidate.Format.nSamplesPerSec);
+            hr = try_capture_candidate("device-rate-pcm16-mono", candidate);
+            if(SUCCEEDED(hr))
+                selected = candidate;
+        }
+        if(FAILED(hr))
+            WARN("Exclusive capture format negotiation failed across all candidates: {:#x}",
+                as_unsigned(hr));
+    }
+    else
+    {
+        TraceFormat("Requesting capture format", &selected.Format);
+        hr = client->IsFormatSupported(sharemode, &selected.Format, al::out_ptr(wfx));
+        if(FAILED(hr))
+        {
+            WARN("Failed to check capture format support: {:#x}", as_unsigned(hr));
+            hr = client->GetMixFormat(al::out_ptr(wfx));
+        }
     }
     if(FAILED(hr))
     {
         ERR("Failed to find a supported capture format: {:#x}", as_unsigned(hr));
         return hr;
     }
+    InputType = selected;
 
     mSampleConv = nullptr;
     mChannelConv = {};
@@ -2867,6 +2949,9 @@ auto WasapiCapture::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
             return E_FAIL;
         }
     }
+    TRACE("Capture format negotiation resolved for {} mode",
+        mExclusiveMode ? "exclusive" : "shared");
+    TraceFormat("Negotiated capture format", &InputType.Format);
 
     auto srcType = DevFmtType{};
     if(IsEqualGUID(InputType.SubFormat, KSDATAFORMAT_SUBTYPE_PCM))
@@ -2942,8 +3027,57 @@ auto WasapiCapture::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
             mDevice->mSampleRate, DevFmtTypeString(srcType), InputType.Format.nSamplesPerSec);
     }
 
-    hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        buf_time.count(), 0, &InputType.Format, nullptr);
+    auto requested_period = ReferenceTime{seconds{mDevice->mUpdateSize}} / mDevice->mSampleRate;
+    auto client_buffer_time = buf_time;
+    if(sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE)
+    {
+        auto min_period_val = REFERENCE_TIME{};
+        hr = client->GetDevicePeriod(nullptr, &min_period_val);
+        if(FAILED(hr))
+        {
+            ERR("Failed to get minimum capture period: {:#x}", as_unsigned(hr));
+            return hr;
+        }
+
+        if(const auto min_period = ReferenceTime{min_period_val}; min_period > requested_period)
+        {
+            requested_period = min_period;
+            WARN("Clamping capture to minimum exclusive period, {}", nanoseconds{min_period});
+        }
+
+        client_buffer_time = requested_period;
+        hr = client->Initialize(sharemode, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            requested_period.count(), requested_period.count(), &InputType.Format, nullptr);
+        if(hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
+        {
+            auto newsize = UINT32{};
+            hr = client->GetBufferSize(&newsize);
+            if(SUCCEEDED(hr))
+            {
+                requested_period = ReferenceTime{seconds{newsize}}
+                    / InputType.Format.nSamplesPerSec;
+                client_buffer_time = requested_period;
+                WARN("Adjusting capture to supported exclusive period, {}",
+                    nanoseconds{requested_period});
+
+                client = nullptr;
+                hr = helper.activateAudioClient(mmdev, __uuidof(IAudioClient),
+                    al::out_ptr(client));
+                if(FAILED(hr))
+                {
+                    ERR("Failed to reactivate audio client: {:#x}", as_unsigned(hr));
+                    return hr;
+                }
+                hr = client->Initialize(sharemode, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    requested_period.count(), requested_period.count(), &InputType.Format, nullptr);
+            }
+        }
+    }
+    else
+    {
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            buf_time.count(), 0, &InputType.Format, nullptr);
+    }
     if(FAILED(hr))
     {
         ERR("Failed to initialize audio client: {:#x}", as_unsigned(hr));
@@ -2971,10 +3105,27 @@ auto WasapiCapture::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
         ERR("Failed to get buffer size: {:#x}", as_unsigned(hr));
         return hr;
     }
-    mDevice->mUpdateSize = RefTime2Samples(min_per, mDevice->mSampleRate);
-    mDevice->mBufferSize = buffer_len;
+    if(sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE)
+    {
+        mDevice->mUpdateSize = gsl::narrow_cast<unsigned>(u64::value_t{buffer_len}
+            * mDevice->mSampleRate / InputType.Format.nSamplesPerSec);
+        mDevice->mBufferSize = mDevice->mUpdateSize * 2u;
+    }
+    else
+    {
+        mDevice->mUpdateSize = RefTime2Samples(min_per, mDevice->mSampleRate);
+        mDevice->mBufferSize = buffer_len;
+    }
 
-    mRing = RingBuffer<std::byte>::Create(buffer_len, mDevice->frameSizeFromFmt(), false);
+    TRACE("Capture initialized in {} mode: requested period {}ns, device period {}ns, "
+        "client buffer {}ns, packet frames {}, update frames {}, ring frames {}",
+        mExclusiveMode ? "exclusive" : "shared",
+        nanoseconds{client_buffer_time}.count(), nanoseconds{min_per}.count(),
+        nanoseconds{ReferenceTime{seconds{buffer_len}} / InputType.Format.nSamplesPerSec}.count(),
+        buffer_len, mDevice->mUpdateSize, mDevice->mBufferSize);
+
+    mRing = RingBuffer<std::byte>::Create(mDevice->mBufferSize, mDevice->frameSizeFromFmt(),
+        false);
 
     hr = client->SetEventHandle(mNotifyEvent);
     if(FAILED(hr))
