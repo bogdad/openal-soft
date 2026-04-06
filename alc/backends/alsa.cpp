@@ -917,10 +917,10 @@ void AlsaCapture::open(std::string_view name)
     case DevFmtFloat: format = SND_PCM_FORMAT_FLOAT; break;
     }
 
-    auto bufferSizeInFrames = snd_pcm_uframes_t{std::max(mDevice->mBufferSize,
-        100u*mDevice->mSampleRate/1000u)};
-    auto periodSizeInFrames = snd_pcm_uframes_t{std::min(mDevice->mBufferSize,
-        25u*mDevice->mSampleRate/1000u)};
+    auto periodSizeInFrames = snd_pcm_uframes_t{std::clamp<snd_pcm_uframes_t>(
+        mDevice->mBufferSize, snd_pcm_uframes_t{64}, snd_pcm_uframes_t{256})};
+    auto bufferSizeInFrames = snd_pcm_uframes_t{std::max(
+        periodSizeInFrames*snd_pcm_uframes_t{4}, snd_pcm_uframes_t{256})};
 
     auto needring = false;
     auto hp = CreateHwParams();
@@ -951,12 +951,22 @@ void AlsaCapture::open(std::string_view name)
     CHECK(snd_pcm_hw_params(mPcmHandle, hp.get()));
     /* retrieve configuration info */
     CHECK(snd_pcm_hw_params_get_period_size(hp.get(), &periodSizeInFrames, nullptr));
+    CHECK(snd_pcm_hw_params_get_buffer_size(hp.get(), &bufferSizeInFrames));
 #undef CHECK
     hp = nullptr;
 
+    auto sp = CreateSwParams();
+#define CHECK(x) do {                                                             if(const auto err = x; err < 0)                                                   throw al::backend_exception{al::backend_error::DeviceError, #x " failed: {}",             snd_strerror(err)};                                               } while(0)
+    CHECK(snd_pcm_sw_params_current(mPcmHandle, sp.get()));
+    CHECK(snd_pcm_sw_params_set_avail_min(mPcmHandle, sp.get(), periodSizeInFrames));
+    CHECK(snd_pcm_sw_params_set_stop_threshold(mPcmHandle, sp.get(), bufferSizeInFrames));
+    CHECK(snd_pcm_sw_params(mPcmHandle, sp.get()));
+#undef CHECK
+    sp = nullptr;
+
     if(needring)
-        mRing = RingBuffer<std::byte>::Create(mDevice->mBufferSize, mDevice->frameSizeFromFmt(),
-            false);
+        mRing = RingBuffer<std::byte>::Create(gsl::narrow_cast<unsigned>(bufferSizeInFrames),
+            mDevice->frameSizeFromFmt(), false);
 
     mDeviceName = name;
 }
