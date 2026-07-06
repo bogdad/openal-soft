@@ -2449,7 +2449,16 @@ void WasapiCapture::recordProc(IAudioClient *client, IAudioCaptureClient *captur
     while(!mKillNow.load(std::memory_order_relaxed))
     {
         auto avail = UINT32{};
-        auto hr = capture->GetNextPacketSize(&avail);
+        auto hr = HRESULT{S_OK};
+        if(mExclusiveMode)
+            /* IAudioCaptureClient::GetNextPacketSize is documented as shared-mode
+             * only; in exclusive mode it always reports 0 available, which would
+             * make this loop never read a packet. The event signals that one
+             * period is ready, so read the buffer directly (GetBuffer returns the
+             * period's frames, or AUDCLNT_S_BUFFER_EMPTY -> numsamples 0). */
+            avail = 1;
+        else
+            hr = capture->GetNextPacketSize(&avail);
         if(FAILED(hr))
             ERR("Failed to get next packet size: {:#x}", as_unsigned(hr));
         else if(avail > 0)
