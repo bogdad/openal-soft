@@ -846,6 +846,12 @@ void CoreAudioCapture::open(std::string_view name)
             "Could not enable audio unit input property: '{}' ({})", FourCCPrinter{err}.c_str(),
             err};
 
+    /* The number of frames the HAL will hand to the render callback. Kept
+     * outside the enumeration block so the MaximumFramesPerSlice clamp below
+     * can see it whether or not the device could be identified.
+     */
+    UInt32 deviceFrameSize{};
+
 #if CAN_ENUMERATE
     if(audioDevice != kAudioDeviceUnknown)
         AudioUnitSetProperty(mAudioUnit, kAudioOutputUnitProperty_CurrentDevice,
@@ -896,11 +902,13 @@ void CoreAudioCapture::open(std::string_view name)
                 propSize, &acceptedFrameSize);
             if(geterr == noErr)
             {
+                deviceFrameSize = acceptedFrameSize;
                 TRACE("CoreAudio capture buffer frame size request for device {}: requested={} accepted={}",
                     audioDevice, requestedFrameSize, acceptedFrameSize);
             }
             else
             {
+                deviceFrameSize = requestedFrameSize;
                 TRACE("CoreAudio capture buffer frame size request for device {}: requested={} (accepted size unavailable: '{}' ({}))",
                     audioDevice, requestedFrameSize, FourCCPrinter{geterr}.c_str(), geterr);
             }
@@ -932,6 +940,41 @@ void CoreAudioCapture::open(std::string_view name)
         throw al::backend_exception{al::backend_error::DeviceError,
             "Could not disable buffer allocation property: '{}' ({})", FourCCPrinter{err}.c_str(),
             err};
+
+    /* Make sure the unit will accept a slice as large as the HAL can deliver.
+     * MaximumFramesPerSlice was only ever read here, never set, and its default
+     * can be smaller than the device's buffer frame size -- on macOS 26 with the
+     * built-in mic it is. AudioUnitRender then fails with kAudioUnitErr_
+     * TooManyFramesToProcess (-10874) on every single callback, so capture
+     * delivers no frames at all while the device otherwise looks healthy. The
+     * property must be set while the unit is uninitialized.
+     */
+    {
+        UInt32 maxFrames{};
+        UInt32 propSize{sizeof(maxFrames)};
+        err = AudioUnitGetProperty(mAudioUnit, kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global, OutputElement, &maxFrames, &propSize);
+        if(err == noErr && propSize == sizeof(maxFrames))
+        {
+            const auto wanted = std::max({maxFrames, deviceFrameSize,
+                gsl::narrow_cast<UInt32>(mDevice->mUpdateSize)});
+            if(wanted > maxFrames)
+            {
+                err = AudioUnitSetProperty(mAudioUnit, kAudioUnitProperty_MaximumFramesPerSlice,
+                    kAudioUnitScope_Global, OutputElement, &wanted, sizeof(wanted));
+                if(err == noErr)
+                    TRACE("CoreAudio capture raised MaximumFramesPerSlice from {} to {}",
+                        maxFrames, wanted);
+                else
+                    WARN("Could not raise MaximumFramesPerSlice from {} to {}: '{}' ({})",
+                        maxFrames, wanted, FourCCPrinter{err}.c_str(), err);
+            }
+        }
+        else
+            WARN("Could not read MaximumFramesPerSlice: '{}' ({})", FourCCPrinter{err}.c_str(),
+                err);
+        err = noErr;
+    }
 
     // Initialize the device
     err = AudioUnitInitialize(mAudioUnit);
